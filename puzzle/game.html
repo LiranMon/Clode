@@ -96,10 +96,8 @@ h2{font-size:clamp(28px,4.5vw,44px)}
 #ghost{opacity:.28}
 #full{opacity:0;transition:opacity .6s}
 #full.show{opacity:1}
-.piece{position:absolute;left:0;top:0;pointer-events:none;will-change:transform;filter:drop-shadow(0 4px 3px rgba(18,58,92,.4))}
-.piece.lift{filter:drop-shadow(0 14px 10px rgba(18,58,92,.45))}
-.piece.placed{filter:none}
-.piece.snap{transition:transform .18s ease-out}
+.piece{position:absolute;left:0;top:0;pointer-events:none;will-change:transform;transform-origin:50% 50%}
+.piece.snap{transition:transform .2s ease-out}
 .win{position:absolute;inset:0;display:grid;place-items:center;background:rgba(18,58,92,.35);z-index:5000;padding:16px}
 .win .box{background:#fff;border:5px solid var(--ink);box-shadow:0 10px 0 var(--ink);border-radius:36px;padding:28px 32px;display:flex;flex-direction:column;align-items:center;gap:18px;text-align:center;max-width:520px;width:100%;animation:pop .45s cubic-bezier(.3,1.6,.5,1)}
 .win .stars{display:flex;gap:8px}
@@ -332,39 +330,70 @@ const WORLDS=[
   {id:'pups',name:'כלבלבי החילוץ',edge:'#e53935',scenes:PUPS},
   {id:'mine',name:'התמונות שלי',edge:'#2fb36b',scenes:null}
 ];
-const cache={};
-function scene(wid,i){const key=wid+i;if(cache[key])return cache[key];const c=document.createElement('canvas');c.width=1200;c.height=900;const x=c.getContext('2d');x.scale(1.5,1.5);WORLDS.find(w=>w.id===wid).scenes[i].draw(x);return cache[key]=c}
-function thumb(src){const c=document.createElement('canvas');c.width=400;c.height=300;c.getContext('2d').drawImage(src,0,0,400,300);return c}
+const FULL_W=1600,FULL_H=1200,TH_W=640,TH_H=480;
+function renderScene(wid,i,w){const c=document.createElement('canvas');c.width=w;c.height=Math.round(w*.75);const x=c.getContext('2d');x.scale(w/800,w/800);WORLDS.find(v=>v.id===wid).scenes[i].draw(x);return c}
+const thumbCache={};
+function sceneThumb(wid,i){const k=wid+i;return thumbCache[k]||(thumbCache[k]=renderScene(wid,i,TH_W))}
+function thumb(src){const c=document.createElement('canvas');c.width=TH_W;c.height=TH_H;c.getContext('2d').drawImage(src,0,0,TH_W,TH_H);return c}
 
-/* custom pictures: {name, cover, items:[{id,url}]} */
-let mine=[]; // [{id,url,c}]
+/* custom pictures: names/order in localStorage, photos (full size) in IndexedDB */
+let mine=[]; // [{id, th: small canvas, src: Blob | dataURL}]
 let mineMeta={name:'',cover:null};
-const MINE_KEY='hero-puzzle-mine-v2';
+const MINE_KEY='hero-puzzle-mine-v3';
+const DB={db:null,
+  open(){return new Promise(res=>{try{const r=indexedDB.open('hero-puzzle',1);r.onupgradeneeded=()=>r.result.createObjectStore('pics');r.onsuccess=()=>{this.db=r.result;res(this.db)};r.onerror=()=>res(null);r.onblocked=()=>res(null)}catch(e){res(null)}})},
+  tx(mode,fn){return new Promise((res,rej)=>{try{const t=this.db.transaction('pics',mode);const rq=fn(t.objectStore('pics'));t.oncomplete=()=>res(rq&&rq.result);t.onerror=t.onabort=()=>rej(t.error)}catch(e){rej(e)}})},
+  put(id,b){return this.tx('readwrite',s=>s.put(b,id))},
+  get(id){return this.tx('readonly',s=>s.get(id))},
+  del(id){return this.db?this.tx('readwrite',s=>s.delete(id)).catch(()=>{}):Promise.resolve()}
+};
 function imgFrom(src){return new Promise((res,rej)=>{const im=new Image();im.onload=()=>res(im);im.onerror=rej;im.src=src})}
-function loadMine(){
-  let data=store.get(MINE_KEY,null);
-  if(!data){const old=store.get('hero-puzzle-mine-v1',[]);data={name:'',cover:null,items:old.map((u,i)=>({id:'p'+Date.now().toString(36)+i,url:u}))}}
+async function imgFromSrc(src){if(typeof src==='string')return imgFrom(src);const u=URL.createObjectURL(src);try{return await imgFrom(u)}finally{URL.revokeObjectURL(u)}}
+function dataUrlToBlob(u){const k=u.indexOf(',');const bin=atob(u.slice(k+1));const a=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);return new Blob([a],{type:'image/jpeg'})}
+function canvasBlob(c,q){return new Promise(res=>{try{c.toBlob(b=>res(b),'image/jpeg',q)}catch(e){res(null)}})}
+function cover(im,W=FULL_W,H=FULL_H){const c=document.createElement('canvas');c.width=W;c.height=H;const x=c.getContext('2d');const s=Math.max(W/im.width,H/im.height);const w=im.width*s,h=im.height*s;x.fillStyle='#fff';x.fillRect(0,0,W,H);x.imageSmoothingQuality='high';x.drawImage(im,(W-w)/2,(H-h)/2,w,h);return c}
+function toUrl(c){const t=document.createElement('canvas');t.width=1000;t.height=750;t.getContext('2d').drawImage(c,0,0,1000,750);return t.toDataURL('image/jpeg',.8)}
+function saveMine(){return store.set(MINE_KEY,{name:mineMeta.name,cover:mineMeta.cover,items:mine.map(m=>typeof m.src==='string'?{id:m.id,url:m.src}:{id:m.id})})}
+async function loadMine(){
+  await DB.open();
+  let data=store.get(MINE_KEY,null),legacy=false;
+  if(!data){const v2=store.get('hero-puzzle-mine-v2',null),v1=store.get('hero-puzzle-mine-v1',null);legacy=!!(v2||v1);
+    data=v2||{name:'',cover:null,items:(v1||[]).map((u,i)=>({id:'p'+Date.now().toString(36)+i,url:u}))}}
   mineMeta={name:data.name||'',cover:data.cover||null};
-  return Promise.all((data.items||[]).map(it=>imgFrom(it.url).then(im=>({id:it.id,url:it.url,c:cover(im)}),()=>null))).then(a=>{mine=a.filter(Boolean)});
+  const out=[];
+  for(const it of data.items||[]){
+    try{
+      let src=it.url||null;
+      if(src&&DB.db){try{await DB.put(it.id,dataUrlToBlob(src));src=null}catch(e){}}
+      if(!src&&DB.db)src=await DB.get(it.id);
+      if(!src)continue;
+      out.push({id:it.id,src,th:cover(await imgFromSrc(src),TH_W,TH_H)});
+    }catch(e){}
+  }
+  mine=out;
+  if(saveMine()&&legacy){try{localStorage.removeItem('hero-puzzle-mine-v2');localStorage.removeItem('hero-puzzle-mine-v1')}catch(e){}}
 }
-function cover(im){const c=document.createElement('canvas');c.width=1200;c.height=900;const x=c.getContext('2d');const s=Math.max(1200/im.width,900/im.height);const w=im.width*s,h=im.height*s;x.fillStyle='#fff';x.fillRect(0,0,1200,900);x.drawImage(im,(1200-w)/2,(900-h)/2,w,h);return c}
-function toUrl(c){const t=document.createElement('canvas');t.width=800;t.height=600;t.getContext('2d').drawImage(c,0,0,800,600);return t.toDataURL('image/jpeg',.8)}
-function saveMine(){return store.set(MINE_KEY,{name:mineMeta.name,cover:mineMeta.cover,items:mine.map(m=>({id:m.id,url:m.url}))})}
+async function fullImage(m){return cover(await imgFromSrc(m.src))}
 function mineName(){return mineMeta.name.trim()||'התמונות שלי'}
 function mineCover(){return mine.find(m=>m.id===mineMeta.cover)||mine[0]}
 const lvlSize=i=>Math.min(i,SIZES.length-1);
 let adding=false;
 async function addFiles(files,status){
-  if(adding||!files.length)return;adding=true;let added=0,full=false;
+  if(adding||!files.length)return;adding=true;let added=0,full=false,bad=0;
   for(let k=0;k<files.length;k++){
     if(status)status(`מוסיפים תמונה ${k+1} מתוך ${files.length}…`);
-    const u=URL.createObjectURL(files[k]);
-    try{const im=await imgFrom(u);const c=cover(im);const item={id:'p'+Date.now().toString(36)+Math.random().toString(36).slice(2,6),url:toUrl(c),c};
-      mine.push(item);if(!saveMine()){mine.pop();saveMine();full=true;break}added++}
-    catch(e){}finally{URL.revokeObjectURL(u)}
+    let im;try{im=await imgFromSrc(files[k])}catch(e){bad++;continue}
+    const c=cover(im),id='p'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);let src=null;
+    if(DB.db){const b=await canvasBlob(c,.88);if(b){try{await DB.put(id,b);src=b}catch(e){full=true}}}
+    if(!src&&!full)src=toUrl(c);
+    if(full)break;
+    mine.push({id,src,th:cover(im,TH_W,TH_H)});c.width=c.height=0;
+    if(!saveMine()){mine.pop();DB.del(id);saveMine();full=true;break}
+    added++;
   }
   adding=false;openWorld('mine');
   if(full)note(added?`נוספו ${added} תמונות. אין מקום לעוד תמונות באייפד — אפשר למחוק תמונות ישנות ולנסות שוב.`:'אין מקום לעוד תמונות באייפד. אפשר למחוק תמונות ישנות ולנסות שוב.',true);
+  else if(bad)note(`${bad===1?'תמונה אחת לא נפתחה':bad+' תמונות לא נפתחו'}. אפשר לנסות תמונה אחרת.`,true);
   else if(added>1)note(`נוספו ${added} תמונות — כל תמונה היא שלב חדש!`);
 }
 function note(text,warn){const p=document.createElement('p');p.className='note'+(warn?' warn':'');p.textContent=text;$('#lvGrid').insertAdjacentElement('beforebegin',p)}
@@ -380,8 +409,8 @@ function renderHome(){
   WORLDS.forEach(w=>{
     const b=document.createElement('button');b.className='card';b.style.setProperty('--edge',w.edge);
     let total=0,got=0;
-    if(w.scenes){b.appendChild(thumb(scene(w.id,0)));total=w.scenes.length;got=w.scenes.filter((_,i)=>done[w.id+'-'+i]).length}
-    else if(mine.length){b.appendChild(thumb(mineCover().c));total=mine.length;got=mine.filter(m=>done['mine-'+m.id]).length}
+    if(w.scenes){b.appendChild(thumb(sceneThumb(w.id,0)));total=w.scenes.length;got=w.scenes.filter((_,i)=>done[w.id+'-'+i]).length}
+    else if(mine.length){b.appendChild(thumb(mineCover().th));total=mine.length;got=mine.filter(m=>done['mine-'+m.id]).length}
     else{const c=document.createElement('canvas');c.width=400;c.height=300;const x=c.getContext('2d');x.fillStyle='#eafaf0';x.fillRect(0,0,400,300);x.setLineDash([14,10]);rrPath(x,20,20,360,260,24);line(x,'#2fb36b',6);x.setLineDash([]);C(x,200,150,52,'#ffc933');x.fillStyle='#123a5c';x.fillRect(195,118,10,64);x.fillRect(168,145,64,10);b.appendChild(c)}
     const n=document.createElement('div');n.className='name';n.textContent=worldName(w);b.appendChild(n);
     const m=document.createElement('div');m.className='meta';
@@ -404,7 +433,7 @@ function openWorld(id){
   if(curWorld.scenes){
     curWorld.scenes.forEach((s,i)=>{
       const sz=SIZES[i];const b=document.createElement('button');b.className='card';b.style.setProperty('--edge',curWorld.edge);
-      b.appendChild(thumb(scene(id,i)));
+      b.appendChild(thumb(sceneThumb(id,i)));
       const badge=document.createElement('div');badge.className='lvl-badge';badge.textContent=i+1;b.appendChild(badge);
       if(done[id+'-'+i]){const st=document.createElement('div');st.className='done-star';st.innerHTML=ICON.star;b.appendChild(st)}
       const n=document.createElement('div');n.className='name';n.textContent=s.name;b.appendChild(n);
@@ -426,7 +455,7 @@ function openWorld(id){
     const sz=SIZES[lvlSize(i)];
     const d=document.createElement('div');d.className='card mine';d.style.setProperty('--edge',curWorld.edge);
     const play=document.createElement('button');play.className='play';play.setAttribute('aria-label',`שלב ${i+1}, ${sz[0]*sz[1]} חלקים`);
-    play.appendChild(thumb(m.c));
+    play.appendChild(thumb(m.th));
     const badge=document.createElement('div');badge.className='lvl-badge';badge.textContent=i+1;play.appendChild(badge);
     if(done['mine-'+m.id]){const st=document.createElement('div');st.className='done-star';st.innerHTML=ICON.star;play.appendChild(st)}
     if(cov&&cov.id===m.id){const cb=document.createElement('div');cb.className='cover-tag';cb.textContent='תמונת השער';play.appendChild(cb)}
@@ -441,7 +470,7 @@ function openWorld(id){
     const cb=tb('★','לבחור כתמונת השער',()=>{mineMeta.cover=m.id;saveMine();openWorld('mine')});if(cov&&cov.id===m.id)cb.classList.add('on');
     const sp=document.createElement('span');sp.style.flex='1';tools.appendChild(sp);
     const del=tb('✕','מחיקת התמונה',()=>{if(!del.classList.contains('sure')){del.classList.add('sure');del.textContent='למחוק?';setTimeout(()=>{if(del.isConnected){del.classList.remove('sure');del.textContent='✕'}},3000);return}
-      mine.splice(i,1);if(mineMeta.cover===m.id)mineMeta.cover=null;saveMine();openWorld('mine')});
+      mine.splice(i,1);DB.del(m.id);if(mineMeta.cover===m.id)mineMeta.cover=null;saveMine();openWorld('mine')});
     del.classList.add('del-btn');
     d.appendChild(tools);
     const lab=document.createElement('div');lab.className='meta small';lab.textContent='או לבחור גודל אחר:';d.appendChild(lab);
@@ -467,12 +496,16 @@ $('#gSound').onclick=()=>{muted=!muted;store.set('hero-puzzle-mute',muted);paint
 /* ---------- puzzle ---------- */
 const stage=$('#stage'),board=$('#board'),hitCtx=document.createElement('canvas').getContext('2d');
 let G=null;
-function sceneFor(wid,i){return wid==='mine'?mine[i].c:scene(wid,i)}
-function startGame(wid,i,size){
-  unlockAudio();curWorld=WORLDS.find(w=>w.id===wid);
+async function sceneFor(wid,i){return wid==='mine'?fullImage(mine[i]):renderScene(wid,i,FULL_W)}
+let startTok=0;
+async function startGame(wid,i,size){
+  unlockAudio();const tok=++startTok;let img;
+  try{img=await sceneFor(wid,i)}catch(e){return}
+  if(tok!==startTok)return;
+  curWorld=WORLDS.find(w=>w.id===wid);
   const [cols,rows]=SIZES[size];const R=Math.random;
   const hE=[],vE=[];for(let r=0;r<rows;r++){hE[r]=[];vE[r]=[];for(let c=0;c<cols;c++){hE[r][c]=R()<.5?1:-1;vE[r][c]=R()<.5?1:-1}}
-  G={wid,i,size,cols,rows,img:sceneFor(wid,i),hE,vE,pieces:[],z:10,won:false};
+  G={wid,i,size,cols,rows,img,hE,vE,pieces:[],z:10,won:false};
   for(let r=0;r<rows;r++)for(let c=0;c<cols;c++)G.pieces.push({c,r,placed:false});
   const nm=wid==='mine'?`${mineName()} · שלב ${i+1}`:curWorld.scenes[i].name;
   $('#gTitle').innerHTML='';$('#gTitle').append(nm+' ');const sp=document.createElement('span');sp.className='count';sp.textContent=`· ${cols*rows} חלקים`;$('#gTitle').append(sp);
@@ -490,57 +523,74 @@ function build(fresh){
   if(!G)return;
   const sw=stage.clientWidth,sh=stage.clientHeight;if(!sw||!sh)return;
   const land=sw>=sh*1.05;let bw,bh,bx,by,tray;
-  if(land){const aw=sw*.6-24,ah=sh-40;bw=Math.min(aw,ah*4/3);bh=bw*.75;bx=sw-16-bw-(aw-bw)/2;by=(sh-bh)/2;tray={x:10,y:10,w:sw*.4-10,h:sh-20}}
+  if(land){const aw=sw*.6-24,ah=sh-40;bw=Math.min(aw,ah*4/3);bh=bw*.75;bx=sw-16-bw;by=(sh-bh)/2;tray={x:10,y:10,w:bx-30,h:sh-20}}
   else{const aw=sw-32,ah=sh*.56-24;bw=Math.min(aw,ah*4/3);bh=bw*.75;bx=(sw-bw)/2;by=14;tray={x:8,y:by+bh+18,w:sw-16,h:sh-(by+bh+18)-8}}
+  bw=Math.round(bw);bh=Math.round(bh);bx=Math.round(bx);by=Math.round(by);
   Object.assign(board.style,{left:bx+'px',top:by+'px',width:bw+'px',height:bh+'px'});
   G.b={x:bx,y:by,w:bw,h:bh};G.sw=sw;G.sh=sh;
-  const dpr=Math.min(window.devicePixelRatio||1,2.5);
-  ['ghost','full'].forEach(id=>{const c=$('#'+id);c.width=Math.round(bw*dpr);c.height=Math.round(bh*dpr);c.getContext('2d').drawImage(G.img,0,0,c.width,c.height)});
-  const cw=bw/G.cols,ch=bh/G.rows,ts=Math.min(cw,ch),pad=Math.ceil(ts*.27)+3;G.cw=cw;G.ch=ch;G.pad=pad;
-  // order tray positions in a loose shuffled grid so pieces don't pile up
-  const loose=G.pieces.filter(p=>!p.placed||fresh);const pw=cw+2*pad,ph=ch+2*pad;
-  const n=loose.length;let best=null;
-  for(let cc=1;cc<=n;cc++){const rr=Math.ceil(n/cc);const s=Math.min(tray.w/cc,tray.h/rr);if(!best||s>best.s)best={cc,rr,s}}
+  const dpr=Math.min(window.devicePixelRatio||1,3);G.dpr=dpr;
+  ['ghost','full'].forEach(id=>{const c=$('#'+id);c.width=Math.round(bw*dpr);c.height=Math.round(bh*dpr);const x=c.getContext('2d');x.imageSmoothingQuality='high';x.drawImage(G.img,0,0,c.width,c.height)});
+  const cw=bw/G.cols,ch=bh/G.rows,ts=Math.min(cw,ch),pad=Math.ceil(ts*.27)+8;G.cw=cw;G.ch=ch;G.pad=pad;
+  const pw=cw+2*pad,ph=ch+2*pad;
+  const n=Math.max(1,G.pieces.filter(p=>fresh||!p.placed).length);let best=null;
+  for(let cc=1;cc<=n;cc++){const rr=Math.ceil(n/cc);const s=Math.min(tray.w/cc/(cw+pad),tray.h/rr/(ch+pad));if(!best||s>best.s)best={cc,rr,s}}
+  G.trayS=Math.max(.5,Math.min(1,best.s*1.1));
   const slots=[];for(let k=0;k<best.cc*best.rr;k++)slots.push(k);for(let k=slots.length-1;k>0;k--){const j=Math.floor(Math.random()*(k+1));[slots[k],slots[j]]=[slots[j],slots[k]]}
   const gw=tray.w/best.cc,gh=tray.h/best.rr;let li=0;
   G.pieces.forEach(p=>{
     if(p.el)p.el.remove();
     const top=p.r===0?0:-G.hE[p.r-1][p.c],bottom=p.r===G.rows-1?0:G.hE[p.r][p.c],left=p.c===0?0:-G.vE[p.r][p.c-1],right=p.c===G.cols-1?0:G.vE[p.r][p.c];
     const path=new Path2D();path.moveTo(pad,pad);edge(path,pad,pad,pad+cw,pad,top,ts);edge(path,pad+cw,pad,pad+cw,pad+ch,right,ts);edge(path,pad+cw,pad+ch,pad,pad+ch,bottom,ts);edge(path,pad,pad+ch,pad,pad,left,ts);path.closePath();
-    const el=document.createElement('canvas');el.className='piece';el.width=Math.ceil(pw*dpr);el.height=Math.ceil(ph*dpr);el.style.width=pw+'px';el.style.height=ph+'px';
-    const x=el.getContext('2d');x.scale(dpr,dpr);x.save();x.clip(path);x.drawImage(G.img,pad-p.c*cw,pad-p.r*ch,bw,bh);x.restore();
-    x.lineWidth=2.5;x.strokeStyle='rgba(255,255,255,.9)';x.stroke(path);x.lineWidth=1;x.strokeStyle='rgba(18,58,92,.35)';x.stroke(path);
+    const el=document.createElement('canvas');el.className='piece';el.width=Math.ceil(pw*dpr);el.height=Math.ceil(ph*dpr);el.style.width=el.width/dpr+'px';el.style.height=el.height/dpr+'px';
     p.el=el;p.path=path;p.w=pw;p.h=ph;p.tx=bx+p.c*cw-pad;p.ty=by+p.r*ch-pad;
     if(fresh)p.placed=false;
-    if(p.placed){p.x=p.tx;p.y=p.ty;el.classList.add('placed');el.style.zIndex=1}
-    else{const k=slots[li++],gx=k%best.cc,gy=Math.floor(k/best.cc);
-      const cx=tray.x+gx*gw+gw/2+(Math.random()-.5)*gw*.25,cy=tray.y+gy*gh+gh/2+(Math.random()-.5)*gh*.25;
-      p.x=Math.max(-pad,Math.min(sw-pw+pad,cx-pw/2));p.y=Math.max(-pad,Math.min(sh-ph+pad,cy-ph/2));p.z=++G.z;el.style.zIndex=p.z}
-    p.lift=false;setPos(p);stage.appendChild(el);
+    if(p.placed){p.x=p.tx;p.y=p.ty;p.s=1;el.classList.add('placed');el.style.zIndex=1}
+    else{const k=slots[li++],gx=k%best.cc,gy=Math.floor(k/best.cc),s=G.trayS;
+      let cx=tray.x+gx*gw+gw/2+(Math.random()-.5)*gw*.2,cy=tray.y+gy*gh+gh/2+(Math.random()-.5)*gh*.2;
+      const hx=(cw/2+pad*.6)*s,hy=(ch/2+pad*.6)*s;
+      cx=Math.max(Math.min(tray.x+hx,sw/2),Math.min(cx,Math.max(tray.x+tray.w-hx,sw/2)));cy=Math.max(Math.min(tray.y+hy,sh/2),Math.min(cy,Math.max(tray.y+tray.h-hy,sh/2)));
+      p.s=s;p.x=cx-pw/2;p.y=cy-ph/2;p.z=++G.z;el.style.zIndex=p.z}
+    p.lift=false;renderPiece(p);setPos(p);stage.appendChild(el);
   });
-  // shrink loose pieces visually when tray is small? keep full size so they match the board exactly
 }
-function setPos(p){p.el.style.transform=`translate(${p.x}px,${p.y}px) scale(${p.lift?1.07:1})`}
-const drags=new Map();
-function local(e){const r=stage.getBoundingClientRect();return[e.clientX-r.left,e.clientY-r.top]}
+function renderPiece(p){
+  const d=G.dpr,x=p.el.getContext('2d');x.setTransform(1,0,0,1,0,0);x.clearRect(0,0,p.el.width,p.el.height);x.setTransform(d,0,0,d,0,0);
+  if(!p.placed){x.save();x.shadowColor='rgba(18,58,92,.45)';x.shadowBlur=5*d;x.shadowOffsetY=3*d;x.fillStyle='#fff';x.fill(p.path);x.restore()}
+  x.save();x.clip(p.path);x.imageSmoothingQuality='high';x.drawImage(G.img,G.pad-p.c*G.cw,G.pad-p.r*G.ch,G.b.w,G.b.h);x.restore();
+  if(p.placed){x.lineWidth=1;x.strokeStyle='rgba(255,255,255,.45)';x.stroke(p.path)}
+  else{x.lineWidth=2.5;x.strokeStyle='rgba(255,255,255,.9)';x.stroke(p.path);x.lineWidth=1;x.strokeStyle='rgba(18,58,92,.35)';x.stroke(p.path)}
+}
+function setPos(p){p.el.style.transform=`translate3d(${p.x}px,${p.y}px,0) scale(${p.s*(p.lift?1.08:1)})`}
+const drags=new Map();let sRect=null,dirty=new Set(),raf=0;
+function flush(){raf=0;dirty.forEach(setPos);dirty.clear()}
+function local(e){const r=sRect||stage.getBoundingClientRect();return[e.clientX-r.left,e.clientY-r.top]}
+function inPiece(p,px,py,slack){const lx=(px-(p.x+p.w/2))/p.s+p.w/2,ly=(py-(p.y+p.h/2))/p.s+p.h/2;
+  if(!slack)return hitCtx.isPointInPath(p.path,lx,ly);return lx>G.pad-slack&&lx<p.w-G.pad+slack&&ly>G.pad-slack&&ly<p.h-G.pad+slack}
 stage.addEventListener('pointerdown',e=>{
-  if(!G||G.won)return;unlockAudio();const[px,py]=local(e);
-  const cand=G.pieces.filter(p=>!p.placed&&![...drags.values()].some(d=>d.p===p)).sort((a,b)=>b.z-a.z);
-  let hit=cand.find(p=>hitCtx.isPointInPath(p.path,px-p.x,py-p.y));
-  if(!hit){const slack=14;hit=cand.find(p=>px>p.x+G.pad-slack&&px<p.x+p.w-G.pad+slack&&py>p.y+G.pad-slack&&py<p.y+p.h-G.pad+slack)}
+  if(!G||G.won||!G.b)return;unlockAudio();if(!drags.size)sRect=stage.getBoundingClientRect();const[px,py]=local(e);
+  const busy=new Set([...drags.values()].map(d=>d.p));
+  const cand=G.pieces.filter(p=>!p.placed&&!busy.has(p)).sort((a,b)=>b.z-a.z);
+  const hit=cand.find(p=>inPiece(p,px,py,0))||cand.find(p=>inPiece(p,px,py,16));
   if(!hit)return;e.preventDefault();
   try{stage.setPointerCapture(e.pointerId)}catch(_){}
-  hit.z=++G.z;hit.el.style.zIndex=hit.z;hit.lift=true;hit.el.classList.add('lift');hit.el.classList.remove('snap');setPos(hit);
-  drags.set(e.pointerId,{p:hit,ox:px-hit.x,oy:py-hit.y});sfx.pick();
+  const ox=(px-(hit.x+hit.w/2))/hit.s,oy=(py-(hit.y+hit.h/2))/hit.s;
+  hit.z=++G.z;hit.el.style.zIndex=hit.z;hit.lift=true;hit.s=1;hit.el.classList.remove('snap');
+  hit.x=px-ox-hit.w/2;hit.y=py-oy-hit.h/2;setPos(hit);
+  drags.set(e.pointerId,{p:hit,ox,oy});sfx.pick();
 });
-stage.addEventListener('pointermove',e=>{const d=drags.get(e.pointerId);if(!d)return;const[px,py]=local(e);const p=d.p;
-  p.x=Math.max(-p.w/2,Math.min(G.sw-p.w/2,px-d.ox));p.y=Math.max(-p.h/2,Math.min(G.sh-p.h/2,py-d.oy));setPos(p)});
-function drop(e){const d=drags.get(e.pointerId);if(!d)return;drags.delete(e.pointerId);const p=d.p;p.lift=false;p.el.classList.remove('lift');
-  if(!G)return;
+stage.addEventListener('pointermove',e=>{const d=drags.get(e.pointerId);if(!d||!G)return;e.preventDefault();const[px,py]=local(e);const p=d.p;
+  const cx=Math.max(0,Math.min(G.sw,px-d.ox)),cy=Math.max(0,Math.min(G.sh,py-d.oy));
+  p.x=cx-p.w/2;p.y=cy-p.h/2;dirty.add(p);if(!raf)raf=requestAnimationFrame(flush)});
+function drop(e){const d=drags.get(e.pointerId);if(!d)return;drags.delete(e.pointerId);if(!drags.size)sRect=null;
+  const p=d.p;p.lift=false;dirty.delete(p);
+  if(!G||!p.el.isConnected)return;
   if(Math.hypot(p.x-p.tx,p.y-p.ty)<Math.min(G.cw,G.ch)*.42){
-    p.placed=true;p.x=p.tx;p.y=p.ty;p.el.classList.add('snap','placed');p.el.style.zIndex=1;setPos(p);sfx.snap();sparkle(p);
+    p.placed=true;p.x=p.tx;p.y=p.ty;p.s=1;p.el.classList.add('snap','placed');p.el.style.zIndex=1;renderPiece(p);setPos(p);sfx.snap();sparkle(p);
     if(G.pieces.every(q=>q.placed))win();
-  }else{setPos(p)}
+  }else{
+    const cx=p.x+p.w/2,cy=p.y+p.h/2,b=G.b;const onBoard=cx>b.x&&cx<b.x+b.w&&cy>b.y&&cy<b.y+b.h;
+    p.s=onBoard?1:G.trayS;p.el.classList.add('snap');setPos(p);
+  }
 }
 stage.addEventListener('pointerup',drop);stage.addEventListener('pointercancel',drop);
 document.addEventListener('gesturestart',e=>e.preventDefault());
@@ -579,7 +629,7 @@ function win(){
   },1300);
 }
 
-let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{if(G&&!G.won&&!$('#game').hidden){drags.clear();build(false)}else if(G&&G.won&&!$('#game').hidden){build(false)}},180)});
+let rt;addEventListener('resize',()=>{if(fxRun)sizeFx();clearTimeout(rt);rt=setTimeout(()=>{if(G&&!G.won&&!$('#game').hidden){drags.clear();sRect=null;build(false)}else if(G&&G.won&&!$('#game').hidden){build(false)}},180)});
 
 loadMine().then(()=>{renderHome();show('home')});
 renderHome();
